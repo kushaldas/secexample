@@ -1,12 +1,13 @@
 #![forbid(unsafe_code)]
 
-//! XML Signature Wrapping (XSW) Attack Demonstration
+//! XML Security Attack Demonstrations
 //!
-//! This example shows:
-//! 1. How a legitimate SAML-like XML document is signed
-//! 2. How an attacker can perform an XSW attack to inject malicious content
-//! 3. How a naive verifier is fooled by the attack
-//! 4. How bergshamra's security features detect and reject XSW attacks
+//! This example shows three classes of XML signature attacks and how
+//! bergshamra's security features detect and reject each one:
+//!
+//! 1. XML Signature Wrapping (XSW) — relocates signed content
+//! 2. Key Injection — attacker embeds their own key in KeyInfo
+//! 3. HMAC Truncation (CVE-2009-0217) — reduces HMAC to brute-forceable length
 
 use bergshamra_dsig::context::DsigContext;
 use bergshamra_dsig::verify::{VerifiedReference, VerifyResult};
@@ -128,6 +129,10 @@ fn sign_document(template: &str, sign_key: Key) -> String {
 
     sign::sign(&ctx, template).expect("signing should succeed")
 }
+
+// ============================================================================
+// XSW ATTACK
+// ============================================================================
 
 /// Perform an XSW attack on the signed document.
 ///
@@ -320,15 +325,11 @@ fn format_references(refs: &[VerifiedReference]) -> String {
         .join(", ")
 }
 
-fn print_separator() {
-    println!("{}", "=".repeat(72));
-}
-
-fn main() {
+/// Demonstrate XSW attack and defence.
+fn demo_xsw() {
     println!();
     print_separator();
     println!("  XML Signature Wrapping (XSW) Attack Demonstration");
-    println!("  Using bergshamra - Pure Rust XML Security Library");
     print_separator();
     println!();
 
@@ -389,35 +390,465 @@ fn main() {
     if secure_result.starts_with("REJECTED") || secure_result.starts_with("INVALID") {
         println!("    SAFE: Secure verifier correctly rejected the forged document!");
     }
+    println!();
+}
 
+// ============================================================================
+// KEY INJECTION ATTACK
+// ============================================================================
+
+/// Build a SAML-like template signed with the ATTACKER's key.
+///
+/// The attacker generates their own key pair, embeds the public key in KeyInfo,
+/// and signs a forged document. A naive verifier that trusts inline KeyValue
+/// will extract the attacker's key and verify the signature -- accepting it.
+fn build_attacker_signed_document() -> String {
+    // Attacker generates their own key pair
+    let attacker_signing = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+    let attacker_verifying = *attacker_signing.verifying_key();
+
+    let attacker_key = Key::new(
+        KeyData::EcP256 {
+            private: Some(attacker_signing),
+            public: attacker_verifying,
+        },
+        KeyUsage::Any,
+    );
+
+    // Build template with attacker's public key in KeyInfo
+    let key_value_xml = attacker_key
+        .data
+        .to_key_value_xml("")
+        .expect("EC key must produce KeyValue XML");
+
+    let mut xml = String::new();
+    xml.push_str(r#"<Response xmlns="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">"#);
+    xml.push('\n');
+    xml.push_str(r#"  <saml:Assertion Id="_forged_assertion">"#);
+    xml.push('\n');
+    xml.push_str(r#"    <saml:Subject>"#);
+    xml.push('\n');
+    xml.push_str(r#"      <saml:NameID>admin@evil.com</saml:NameID>"#);
+    xml.push('\n');
+    xml.push_str(r#"    </saml:Subject>"#);
+    xml.push('\n');
+    xml.push_str(r#"    <saml:Conditions NotOnOrAfter="2099-12-31T23:59:59Z">"#);
+    xml.push('\n');
+    xml.push_str(r#"      <saml:AudienceRestriction>"#);
+    xml.push('\n');
+    xml.push_str(r#"        <saml:Audience>https://sp.example.com</saml:Audience>"#);
+    xml.push('\n');
+    xml.push_str(r#"      </saml:AudienceRestriction>"#);
+    xml.push('\n');
+    xml.push_str(r#"    </saml:Conditions>"#);
+    xml.push('\n');
+    xml.push_str(r#"    <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">"#);
+    xml.push('\n');
+    xml.push_str(r#"      <ds:SignedInfo>"#);
+    xml.push('\n');
+    xml.push_str(r#"        <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#);
+    xml.push('\n');
+    xml.push_str(r#"        <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256"/>"#);
+    xml.push('\n');
+    xml.push_str(r##"        <ds:Reference URI="#_forged_assertion">"##);
+    xml.push('\n');
+    xml.push_str(r#"          <ds:Transforms>"#);
+    xml.push('\n');
+    xml.push_str(r#"            <ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/>"#);
+    xml.push('\n');
+    xml.push_str(
+        r#"            <ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#,
+    );
+    xml.push('\n');
+    xml.push_str(r#"          </ds:Transforms>"#);
+    xml.push('\n');
+    xml.push_str(
+        r#"          <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>"#,
+    );
+    xml.push('\n');
+    xml.push_str(r#"          <ds:DigestValue></ds:DigestValue>"#);
+    xml.push('\n');
+    xml.push_str(r#"        </ds:Reference>"#);
+    xml.push('\n');
+    xml.push_str(r#"      </ds:SignedInfo>"#);
+    xml.push('\n');
+    xml.push_str(r#"      <ds:SignatureValue></ds:SignatureValue>"#);
+    xml.push('\n');
+    xml.push_str(r#"      <ds:KeyInfo>"#);
+    xml.push('\n');
+    xml.push_str("        <ds:KeyValue>");
+    xml.push_str(&key_value_xml);
+    xml.push_str("</ds:KeyValue>");
+    xml.push('\n');
+    xml.push_str(r#"      </ds:KeyInfo>"#);
+    xml.push('\n');
+    xml.push_str(r#"    </ds:Signature>"#);
+    xml.push('\n');
+    xml.push_str(r#"  </saml:Assertion>"#);
+    xml.push('\n');
+    xml.push_str(r#"</Response>"#);
+
+    // Sign it with the attacker's key
+    let mut mgr = KeysManager::new();
+    mgr.add_key(attacker_key);
+    let ctx = DsigContext::new(mgr);
+    sign::sign(&ctx, &xml).expect("attacker signing should succeed")
+}
+
+/// Naive verifier with NO pre-loaded key -- relies entirely on inline KeyInfo.
+/// This is the insecure pattern that enables key injection attacks.
+fn naive_verify_no_key(xml: &str) -> String {
+    let mgr = KeysManager::new();
+    // No keys loaded, no trusted_keys_only -- will extract from KeyInfo
+    let ctx = DsigContext::new(mgr);
+
+    match verify::verify(&ctx, xml) {
+        Ok(result) => {
+            if result.is_valid() {
+                "VALID - signature verified (using inline key from KeyInfo)".to_string()
+            } else if let VerifyResult::Invalid { reason } = result {
+                format!("INVALID - {reason}")
+            } else {
+                unreachable!()
+            }
+        }
+        Err(e) => format!("ERROR - {e}"),
+    }
+}
+
+/// Secure verifier that only trusts the pre-loaded IdP key.
+fn secure_verify_key_injection(xml: &str, idp_key: Key) -> String {
+    let mut mgr = KeysManager::new();
+    mgr.add_key(idp_key);
+
+    let mut ctx = DsigContext::new(mgr);
+    ctx.trusted_keys_only = true; // Ignore inline keys!
+
+    match verify::verify(&ctx, xml) {
+        Ok(result) => {
+            if result.is_valid() {
+                "VALID - signature verified (using trusted IdP key)".to_string()
+            } else if let VerifyResult::Invalid { reason } = result {
+                format!("INVALID - {reason}")
+            } else {
+                unreachable!()
+            }
+        }
+        Err(e) => format!("REJECTED - {e}"),
+    }
+}
+
+/// Demonstrate Key Injection attack and defence.
+fn demo_key_injection() {
     println!();
     print_separator();
-    println!("  SUMMARY");
+    println!("  Key Injection Attack Demonstration");
     print_separator();
     println!();
-    println!("  The XSW attack moves the legitimately signed content to an");
-    println!("  unexpected location and injects forged content at the original");
-    println!("  position. The XML signature remains mathematically valid because");
-    println!("  the signed bytes have not changed -- they have just been relocated.");
+
+    // The legitimate IdP key (what the SP trusts)
+    println!("[1] Generating legitimate IdP key pair...");
+    let (idp_sign_key, idp_verify_key) = generate_keypair();
+    println!("    Done.");
     println!();
-    println!("  Defences provided by bergshamra:");
+
+    // Sign a legitimate document with the IdP key
+    println!("[2] Creating legitimately signed SAML document...");
+    println!("    Subject: alice@example.com (signed by IdP)");
+    let template = build_saml_template(&idp_sign_key);
+    let legit_signed = sign_document(&template, idp_sign_key);
+    println!("    Document signed with IdP key.");
     println!();
-    println!("  1. DUPLICATE ID DETECTION (always on)");
-    println!("     Rejects documents where two elements share the same Id.");
-    println!("     Forces attackers to strip/change Ids, making attacks harder.");
+
+    // Attacker creates their own signed document
+    println!("[3] Attacker creates forged document with their own key...");
+    println!("    - Generates a new EC P-256 key pair");
+    println!("    - Embeds attacker's public key in <KeyInfo><KeyValue>");
+    println!("    - Signs forged assertion (admin@evil.com) with attacker's key");
+    let attacker_signed = build_attacker_signed_document();
+    println!("    Forged document created and signed.");
     println!();
-    println!("  2. STRICT VERIFICATION MODE (ctx.strict_verification = true)");
-    println!("     Requires that each signed reference resolves to the document");
-    println!("     root, an ancestor of Signature, or a sibling of Signature.");
-    println!("     This blocks XSW attacks that relocate signed content.");
+
+    // Naive verifier: trusts inline keys from KeyInfo
+    println!("[4] Verifying with NAIVE verifier (trusts inline keys)...");
     println!();
-    println!("  3. TRUSTED KEYS ONLY (ctx.trusted_keys_only = true)");
-    println!("     Ignores inline keys in KeyInfo and only uses pre-loaded keys.");
-    println!("     Prevents attackers from signing with their own key.");
+
+    println!("    Legitimate document:");
+    let naive_legit = naive_verify_no_key(&legit_signed);
+    println!("    Result: {naive_legit}");
     println!();
-    println!("  4. VERIFY RESULT INSPECTION");
-    println!("     VerifyResult::Valid carries `references` metadata showing");
-    println!("     exactly which nodes the signature covers. Applications should");
-    println!("     check that the signature covers the element they consume.");
+
+    println!("    Attacker's forged document:");
+    let naive_forged = naive_verify_no_key(&attacker_signed);
+    println!("    Result: {naive_forged}");
+    if naive_forged.starts_with("VALID") {
+        println!("    DANGER: Naive verifier accepted the forged document!");
+        println!("    It extracted the attacker's key from KeyInfo and verified");
+        println!("    the attacker's own signature -- a circular trust failure.");
+    }
+    println!();
+
+    // Secure verifier: only trusts pre-loaded IdP key
+    print_separator();
+    println!("  DEFENCE PHASE");
+    print_separator();
+    println!();
+    println!("[5] Verifying with SECURE verifier (trusted_keys_only = true)...");
+    println!("    Only the IdP's key is loaded in KeysManager.");
+    println!();
+
+    println!("    Legitimate document:");
+    let secure_legit = secure_verify_key_injection(&legit_signed, idp_verify_key.clone());
+    println!("    Result: {secure_legit}");
+    println!();
+
+    println!("    Attacker's forged document:");
+    let secure_forged = secure_verify_key_injection(&attacker_signed, idp_verify_key);
+    println!("    Result: {secure_forged}");
+    if !secure_forged.starts_with("VALID") {
+        println!("    SAFE: Secure verifier rejected the forged document!");
+        println!("    The attacker's inline key was ignored; only the IdP key was");
+        println!("    available, and it doesn't match the attacker's signature.");
+    }
+    println!();
+}
+
+// ============================================================================
+// HMAC TRUNCATION ATTACK (CVE-2009-0217)
+// ============================================================================
+
+/// Build an HMAC-SHA256 signed XML template with optional HMACOutputLength truncation.
+fn build_hmac_template(truncation_bits: Option<usize>) -> String {
+    let hmac_output_elem = match truncation_bits {
+        Some(bits) => format!("\n        <ds:HMACOutputLength>{bits}</ds:HMACOutputLength>"),
+        None => String::new(),
+    };
+
+    let mut xml = String::new();
+    xml.push_str(r#"<Document>"#);
+    xml.push('\n');
+    xml.push_str(r#"  <Data Id="_data1">Sensitive payload: transfer $10,000</Data>"#);
+    xml.push('\n');
+    xml.push_str(r#"  <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">"#);
+    xml.push('\n');
+    xml.push_str(r#"    <ds:SignedInfo>"#);
+    xml.push('\n');
+    xml.push_str(
+        r#"      <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#,
+    );
+    xml.push('\n');
+    xml.push_str(r#"      <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#hmac-sha256">"#);
+    xml.push_str(&hmac_output_elem);
+    xml.push('\n');
+    xml.push_str(r#"      </ds:SignatureMethod>"#);
+    xml.push('\n');
+    xml.push_str(r##"      <ds:Reference URI="#_data1">"##);
+    xml.push('\n');
+    xml.push_str(r#"        <ds:Transforms>"#);
+    xml.push('\n');
+    xml.push_str(
+        r#"          <ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#,
+    );
+    xml.push('\n');
+    xml.push_str(r#"        </ds:Transforms>"#);
+    xml.push('\n');
+    xml.push_str(
+        r#"        <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>"#,
+    );
+    xml.push('\n');
+    xml.push_str(r#"        <ds:DigestValue></ds:DigestValue>"#);
+    xml.push('\n');
+    xml.push_str(r#"      </ds:Reference>"#);
+    xml.push('\n');
+    xml.push_str(r#"    </ds:SignedInfo>"#);
+    xml.push('\n');
+    xml.push_str(r#"    <ds:SignatureValue></ds:SignatureValue>"#);
+    xml.push('\n');
+    xml.push_str(r#"    <ds:KeyInfo>"#);
+    xml.push('\n');
+    xml.push_str(r#"      <ds:KeyName>shared-secret</ds:KeyName>"#);
+    xml.push('\n');
+    xml.push_str(r#"    </ds:KeyInfo>"#);
+    xml.push('\n');
+    xml.push_str(r#"  </ds:Signature>"#);
+    xml.push('\n');
+    xml.push_str(r#"</Document>"#);
+
+    xml
+}
+
+/// Naive HMAC verifier: no minimum output length enforcement.
+fn hmac_verify_naive(xml: &str, hmac_key: Key) -> String {
+    let mut mgr = KeysManager::new();
+    mgr.add_key(hmac_key);
+    let ctx = DsigContext::new(mgr);
+    // hmac_min_out_len defaults to 0 -- no enforcement
+
+    match verify::verify(&ctx, xml) {
+        Ok(result) => {
+            if result.is_valid() {
+                "VALID - HMAC signature verified".to_string()
+            } else if let VerifyResult::Invalid { reason } = result {
+                format!("INVALID - {reason}")
+            } else {
+                unreachable!()
+            }
+        }
+        Err(e) => format!("ERROR - {e}"),
+    }
+}
+
+/// Secure HMAC verifier: enforces minimum 128-bit HMAC output.
+fn hmac_verify_secure(xml: &str, hmac_key: Key) -> String {
+    let mut mgr = KeysManager::new();
+    mgr.add_key(hmac_key);
+    let mut ctx = DsigContext::new(mgr);
+    ctx.hmac_min_out_len = 128; // Minimum 128-bit HMAC (CVE-2009-0217 defence)
+
+    match verify::verify(&ctx, xml) {
+        Ok(result) => {
+            if result.is_valid() {
+                "VALID - HMAC signature verified".to_string()
+            } else if let VerifyResult::Invalid { reason } = result {
+                format!("INVALID - {reason}")
+            } else {
+                unreachable!()
+            }
+        }
+        Err(e) => format!("REJECTED - {e}"),
+    }
+}
+
+/// Demonstrate HMAC truncation attack (CVE-2009-0217) and defence.
+fn demo_hmac_truncation() {
+    println!();
+    print_separator();
+    println!("  HMAC Truncation Attack (CVE-2009-0217) Demonstration");
+    print_separator();
+    println!();
+
+    // Generate a shared HMAC key (32 bytes for HMAC-SHA256)
+    println!("[1] Generating shared HMAC-SHA256 key (32 bytes)...");
+    let hmac_secret: Vec<u8> = {
+        let mut buf = vec![0u8; 32];
+        use rand::RngCore;
+        rand::rngs::OsRng.fill_bytes(&mut buf);
+        buf
+    };
+
+    let hmac_key = Key::new(KeyData::Hmac(hmac_secret), KeyUsage::Any).with_name("shared-secret");
+    println!("    Done.");
+    println!();
+
+    // Sign a normal document (full 256-bit HMAC)
+    println!("[2] Signing document with full HMAC-SHA256 (256 bits)...");
+    let template_full = build_hmac_template(None);
+    let mut mgr = KeysManager::new();
+    mgr.add_key(hmac_key.clone());
+    let ctx = DsigContext::new(mgr);
+    let signed_full = sign::sign(&ctx, &template_full).expect("HMAC signing should succeed");
+    println!("    Document signed (full 256-bit HMAC output).");
+    println!();
+
+    // Verify the full-HMAC document with both verifiers
+    println!("[3] Verifying full-HMAC document...");
+    let naive_full = hmac_verify_naive(&signed_full, hmac_key.clone());
+    let secure_full = hmac_verify_secure(&signed_full, hmac_key.clone());
+    println!("    Naive verifier:  {naive_full}");
+    println!("    Secure verifier: {secure_full}");
+    println!("    Both accept the legitimately signed document.");
+    println!();
+
+    // Now sign with HMACOutputLength=8 (only 1 byte of HMAC!)
+    print_separator();
+    println!("  ATTACK PHASE");
+    print_separator();
+    println!();
+    println!("[4] Signing document with truncated HMAC (8 bits = 1 byte)...");
+    println!("    <HMACOutputLength>8</HMACOutputLength>");
+    println!("    This reduces the HMAC to 1 byte -- brute-forceable in ~128 tries.");
+    let template_truncated = build_hmac_template(Some(8));
+    let mut mgr = KeysManager::new();
+    mgr.add_key(hmac_key.clone());
+    let ctx = DsigContext::new(mgr);
+    let signed_truncated =
+        sign::sign(&ctx, &template_truncated).expect("truncated HMAC signing should succeed");
+    println!("    Document signed with 8-bit HMAC.");
+    println!();
+
+    // Naive verifier: no minimum HMAC length enforcement
+    println!("[5] Verifying truncated-HMAC document...");
+    println!();
+    println!("    NAIVE VERIFIER (no minimum HMAC length):");
+    let naive_truncated = hmac_verify_naive(&signed_truncated, hmac_key.clone());
+    println!("    Result: {naive_truncated}");
+    if naive_truncated.starts_with("VALID") {
+        println!("    DANGER: Naive verifier accepted the 8-bit HMAC!");
+        println!("    An attacker can brute-force a 1-byte HMAC in ~128 attempts.");
+        println!("    They can forge any document content and find a matching");
+        println!("    1-byte HMAC value by trial and error.");
+    }
+    println!();
+
+    // Secure verifier: enforce minimum 128-bit HMAC output
+    println!("    SECURE VERIFIER (hmac_min_out_len = 128 bits):");
+    let secure_truncated = hmac_verify_secure(&signed_truncated, hmac_key);
+    println!("    Result: {secure_truncated}");
+    if secure_truncated.starts_with("REJECTED") || secure_truncated.starts_with("INVALID") {
+        println!("    SAFE: Secure verifier rejected the truncated HMAC!");
+    }
+    println!();
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
+
+fn print_separator() {
+    println!("{}", "=".repeat(72));
+}
+
+fn main() {
+    println!();
+    print_separator();
+    println!("  XML Security Attack Demonstrations");
+    println!("  Using bergshamra - Pure Rust XML Security Library");
+    print_separator();
+
+    // Demo 1: XML Signature Wrapping
+    demo_xsw();
+
+    // Demo 2: Key Injection
+    demo_key_injection();
+
+    // Demo 3: HMAC Truncation
+    demo_hmac_truncation();
+
+    // Combined summary
+    print_separator();
+    println!("  SUMMARY OF DEFENCES");
+    print_separator();
+    println!();
+    println!("  Attack 1: XML Signature Wrapping (XSW)");
+    println!("  Relocates signed content to fool the application.");
+    println!("  Defence: ctx.strict_verification = true");
+    println!("           + inspect VerifyResult::references");
+    println!();
+    println!("  Attack 2: Key Injection");
+    println!("  Attacker signs with their own key embedded in KeyInfo.");
+    println!("  Defence: ctx.trusted_keys_only = true");
+    println!("           (only use pre-loaded keys, ignore inline KeyInfo)");
+    println!();
+    println!("  Attack 3: HMAC Truncation (CVE-2009-0217)");
+    println!("  Reduces HMAC output to 1 byte, brute-forceable in ~128 tries.");
+    println!("  Defence: ctx.hmac_min_out_len = 128");
+    println!("           (reject HMACs shorter than 128 bits)");
+    println!();
+    println!("  Recommended configuration:");
+    println!();
+    println!("    let mut ctx = DsigContext::new(keys_manager);");
+    println!("    ctx.trusted_keys_only = true;");
+    println!("    ctx.strict_verification = true;");
+    println!("    ctx.hmac_min_out_len = 128;");
     println!();
 }

@@ -1,26 +1,41 @@
-# secexample -- XML Signature Wrapping (XSW) Attack Demo
+# secexample -- XML Security Attack Demos
 
-A practical demonstration of XML Signature Wrapping attacks and how to
-defend against them using [bergshamra](https://crates.io/crates/bergshamra),
+A practical demonstration of three classes of XML signature attacks and how
+to defend against them using [bergshamra](https://crates.io/crates/bergshamra),
 a pure-Rust XML Security library.
 
-## What is an XSW attack?
+## Attacks demonstrated
 
-XML Digital Signatures protect the **integrity** of specific elements in an
-XML document. The signature covers a set of bytes identified by a URI
-reference (e.g. `URI="#_assertion123"`), not the document as a whole.
+| # | Attack | CVE | Defence |
+|---|--------|-----|---------|
+| 1 | XML Signature Wrapping (XSW) | — | `strict_verification` + reference inspection |
+| 2 | Key Injection | — | `trusted_keys_only` |
+| 3 | HMAC Truncation | CVE-2009-0217 | `hmac_min_out_len` |
 
-An XML Signature Wrapping attack exploits this by **relocating** the
-legitimately signed element to a different position in the document tree and
-inserting forged content at the position the application expects to read.
-Because the signed bytes are unchanged -- just moved -- the signature remains
-mathematically valid.
+## Running
+
+```bash
+cargo run
+```
+
+---
+
+## Attack 1: XML Signature Wrapping (XSW)
+
+### What is it?
+
+XML Digital Signatures protect the **integrity** of specific elements
+identified by a URI reference (e.g. `URI="#_assertion123"`), not the
+document as a whole.
+
+An XSW attack **relocates** the legitimately signed element to a different
+position in the document tree and inserts forged content at the position the
+application expects to read. Because the signed bytes are unchanged -- just
+moved -- the signature remains mathematically valid.
 
 This is especially dangerous in SAML, where a Service Provider verifies the
 XML signature on a `<Response>` or `<Assertion>` and then extracts the
-authenticated user identity from the assertion. If the SP does not confirm
-that the signature actually covers the assertion it processes, an attacker
-can inject an arbitrary identity.
+authenticated user identity from the assertion.
 
 ### Attack performed in this demo
 
@@ -48,101 +63,108 @@ LEGITIMATE DOCUMENT            ATTACKED DOCUMENT
                                </Response>
 ```
 
-The signature reference `#_assertion123` still resolves to the original
-assertion inside `<Extensions>`, so verification succeeds. A naive
-application that processes "the first `<Assertion>` child of `<Response>`"
-picks up the forged one instead.
+### Defences
 
-## Defences demonstrated
+1. **Duplicate ID detection** (always on) -- rejects documents with two
+   elements sharing the same `Id`, forcing attackers to strip or change Ids.
 
-### 1. Duplicate ID detection (always on)
+2. **Strict verification** (`ctx.strict_verification = true`) -- requires
+   every reference target to be the document root, an ancestor of
+   `<Signature>`, or a sibling of `<Signature>`.
 
-Bergshamra unconditionally rejects documents containing two elements with
-the same `Id` attribute value. This forces the attacker to either strip or
-change the `Id` on the forged element, which limits the attack surface. In
-this demo the forged assertion has no `Id` at all.
+3. **Reference inspection** (`VerifyResult::references`) -- applications
+   check that the signature covers the element they intend to consume.
 
-### 2. Trusted keys only (`ctx.trusted_keys_only = true`)
+---
 
-When enabled, bergshamra ignores inline keys embedded in `<KeyInfo>`
-(`<KeyValue>`, `<X509Certificate>`, etc.) and only uses keys pre-loaded
-into the `KeysManager`. Without this, an attacker who controls the XML can
-embed their own key and produce a valid signature.
+## Attack 2: Key Injection
 
-### 3. Strict verification mode (`ctx.strict_verification = true`)
+### What is it?
 
-When enabled, bergshamra enforces that every same-document reference target
-is:
+XML Signatures can embed the signer's public key inside `<KeyInfo>` as a
+`<KeyValue>`, `<X509Certificate>`, or `<DEREncodedKeyValue>`. A naive
+verifier that extracts and trusts this inline key has a circular trust
+problem: the attacker generates their own key pair, signs forged content,
+and embeds their public key in `<KeyInfo>`. The verifier extracts the
+attacker's key, checks the attacker's signature against the attacker's key,
+and accepts it.
 
-- the document root element, or
-- an ancestor of `<Signature>`, or
-- a sibling of `<Signature>`.
+This completely bypasses the trust model -- the signature is self-asserted
+rather than verified against a trusted key.
 
-This blocks many XSW variants where signed content is moved to an
-unexpected depth in the tree.
-
-### 4. Reference inspection (`VerifyResult::references`)
-
-A successful verification returns `VerifyResult::Valid` which carries a
-`references` field listing every `<Reference>` and the `NodeId` it resolved
-to. Applications **must** check that the signature covers the element they
-intend to consume. The secure verifier in this demo confirms that the signed
-node is a direct child of the document element -- if it has been wrapped
-inside an `<Extensions>` element, the check fails.
-
-## Running
-
-```bash
-cargo run
-```
-
-Sample output:
+### Attack performed in this demo
 
 ```
-========================================================================
-  XML Signature Wrapping (XSW) Attack Demonstration
-  Using bergshamra - Pure Rust XML Security Library
-========================================================================
+LEGITIMATE FLOW                 ATTACK FLOW
+=================               =================
+IdP signs assertion             Attacker signs assertion
+  with IdP private key            with attacker's private key
+IdP embeds IdP public key       Attacker embeds attacker's public key
+  in <KeyInfo>                    in <KeyInfo>
 
-[1] Generating EC P-256 key pair...
-    Done.
-
-[2] Creating and signing SAML-like document...
-    Subject: alice@example.com
-    Assertion Id: _assertion123
-    Document signed successfully.
-
-[3] Verifying legitimate signed document...
-    Naive verifier:  VALID - signature verified
-    Secure verifier: VALID - signature verified, references validated
-    Both verifiers accept the legitimate document.
-
-  ATTACK PHASE
-
-[4] Performing XML Signature Wrapping attack...
-    Attack document created.
-
-[5] Verifying attacked document...
-
-    NAIVE VERIFIER (no XSW protection):
-    Result: VALID - signature verified
-    DANGER: Naive verifier accepted the forged document!
-    An application would now process admin@evil.com as authenticated.
-
-    SECURE VERIFIER (strict_verification + trusted_keys_only):
-    Result: REJECTED - signed content is not a direct child of the document root
-    SAFE: Secure verifier correctly rejected the forged document!
+SP verifies signature           SP verifies signature
+  using inline key                using inline key
+  (IdP's key -- correct)          (attacker's key -- WRONG TRUST!)
+SP accepts alice@example.com    SP accepts admin@evil.com
 ```
 
-## Recommended SAML configuration
+### Defence
+
+**Trusted keys only** (`ctx.trusted_keys_only = true`) -- bergshamra ignores
+inline keys from `<KeyInfo>` and only uses keys pre-loaded into the
+`KeysManager`. The attacker's embedded key is never extracted, and the
+signature fails to verify because the attacker's signature doesn't match
+any trusted key.
+
+---
+
+## Attack 3: HMAC Truncation (CVE-2009-0217)
+
+### What is it?
+
+HMAC-based XML signatures support an optional `<HMACOutputLength>` element
+that truncates the HMAC output. If an attacker can inject
+`<HMACOutputLength>8</HMACOutputLength>` (reducing the HMAC to 1 byte),
+the signature becomes brute-forceable in approximately 128 attempts (1 in
+256 chance per guess).
+
+This was a widespread vulnerability (CVE-2009-0217) affecting many XML
+security implementations including Apache XML Security, .NET, and others.
+
+### Attack performed in this demo
+
+```
+LEGITIMATE DOCUMENT              ATTACKED DOCUMENT
+===================              ===================
+<SignatureMethod                 <SignatureMethod
+  Algorithm="hmac-sha256"/>        Algorithm="hmac-sha256">
+                                   <HMACOutputLength>8</HMACOutputLength>
+                                 </SignatureMethod>
+
+HMAC output: 32 bytes            HMAC output: 1 byte
+(256 bits -- infeasible           (8 bits -- brute-force
+ to brute-force)                  in ~128 tries)
+```
+
+### Defence
+
+**Minimum HMAC output length** (`ctx.hmac_min_out_len = 128`) -- bergshamra
+rejects any document where `<HMACOutputLength>` specifies fewer bits than
+the configured minimum. The W3C recommendation is at least half the hash
+output length; 128 bits is a safe minimum for all HMAC variants.
+
+---
+
+## Recommended configuration
 
 ```rust
 use bergshamra_dsig::context::DsigContext;
 use bergshamra_keys::manager::KeysManager;
 
 let mut ctx = DsigContext::new(keys_manager);
-ctx.trusted_keys_only = true;     // reject inline keys
-ctx.strict_verification = true;   // reject unexpected reference positions
+ctx.trusted_keys_only = true;     // reject inline keys (key injection)
+ctx.strict_verification = true;   // reject relocated references (XSW)
+ctx.hmac_min_out_len = 128;       // reject truncated HMACs (CVE-2009-0217)
 ```
 
 After verification succeeds, always inspect `VerifyResult::references` to
