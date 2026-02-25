@@ -1,0 +1,16 @@
+[package]
+name = "secexample"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bergshamra = "0.2.0"
+bergshamra-dsig = "0.2.0"
+bergshamra-keys = "0.2.0"
+bergshamra-crypto = "0.2.0"
+bergshamra-c14n = "0.2.0"
+bergshamra-xml = "0.2.0"
+bergshamra-core = "0.2.0"
+p256 = { version = "0.13", features = ["ecdsa"] }
+rand = "0.8"
+uppsala = "0.3.0"
